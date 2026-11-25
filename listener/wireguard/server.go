@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,12 +28,17 @@ const (
 	defaultMTU    = 1408
 	defaultIPv4   = "10.66.0.0/16"
 	udpIdleWindow = 60 * time.Second
+	// endpointRefresh is how often the peer endpoints are read from the device: the
+	// device learns one on every authenticated packet, and a peer that roams between
+	// networks must be seen as the same user on the new address.
+	endpointRefresh = 5 * time.Second
 )
 
 // wgDevice is the part of the two AmneziaWG implementations and of
 // wireguard-go's device the listener uses.
 type wgDevice interface {
 	IpcSet(string) error
+	IpcGet() (string, error)
 	Up() error
 	Close()
 }
@@ -46,6 +52,7 @@ type wgDevice interface {
 // cap_drop: ALL + NET_BIND_SERVICE.
 type Listener struct {
 	closed    atomic.Bool
+	closeCh   chan struct{}
 	config    LC.WireGuardServer
 	tunnel    C.Tunnel
 	dev       wgDevice
@@ -66,6 +73,12 @@ type Listener struct {
 	mu        sync.RWMutex
 	peers     []peer
 	byAddress map[netip.Addr]string
+	// endpoints maps a peer's inner address to the address it last reached the node
+	// from, as the device knows it. The panel counts devices, applies the ingress
+	// filter and runs the torrent blocker by the client's source IP, so a connection
+	// must carry the real one, never the tunnel address: an inner address is the same
+	// for a phone on Wi-Fi and on LTE, and it is not an address the panel can ban.
+	endpoints map[netip.Addr]netip.AddrPort
 }
 
 // New starts the listener: the UDP socket, the userspace stack and the device.
@@ -111,6 +124,8 @@ func New(config LC.WireGuardServer, lc C.InboundListenConfig, tunnel C.Tunnel, a
 		inName:    inName,
 		additions: additions,
 		private:   private,
+		endpoints: make(map[netip.Addr]netip.AddrPort),
+		closeCh:   make(chan struct{}),
 	}
 
 	if ipv4 != "" {
@@ -214,6 +229,7 @@ func New(config LC.WireGuardServer, lc C.InboundListenConfig, tunnel C.Tunnel, a
 		return nil, fmt.Errorf("wireguard: up: %w", err)
 	}
 
+	go sl.watchEndpoints()
 	return sl, nil
 }
 
@@ -229,6 +245,7 @@ func (l *Listener) Close() error {
 	if l.closed.Swap(true) {
 		return nil
 	}
+	close(l.closeCh)
 	// The device closes the bind, the stack and the tun side itself; the socket
 	// is only closed here for the case the device never got to it.
 	l.dev.Close()
@@ -328,19 +345,88 @@ func (l *Listener) userOf(addr netip.Addr) string {
 	return l.byAddress[addr.Unmap()]
 }
 
-// baseMetadata is the metadata common to every connection of a peer: the
-// inbound name and user, and the peer's inner address as the source.
-func (l *Listener) baseMetadata(src netip.AddrPort, user string) *C.Metadata {
+// watchEndpoints keeps the peer endpoints current. The tunnel gives a connection
+// only its inner source address, and that address says which user it is but not
+// which device: the panel needs the address the peer reached the node from.
+func (l *Listener) watchEndpoints() {
+	ticker := time.NewTicker(endpointRefresh)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-l.closeCh:
+			return
+		case <-ticker.C:
+			l.refreshEndpoints()
+		}
+	}
+}
+
+// refreshEndpoints reads the peer list from the device and maps each peer's inner
+// address to its current endpoint.
+func (l *Listener) refreshEndpoints() {
+	raw, err := l.dev.IpcGet()
+	if err != nil {
+		return
+	}
+	byPub := make(map[string]netip.AddrPort)
+	var current string
+	for _, line := range strings.Split(raw, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "public_key":
+			current = value
+		case "endpoint":
+			if current == "" {
+				continue
+			}
+			if ap, err := netip.ParseAddrPort(value); err == nil {
+				byPub[current] = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+			}
+		}
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, p := range l.peers {
+		ap, ok := byPub[hexKey(p.publicKey)]
+		if !ok {
+			continue
+		}
+		l.endpoints[p.address] = ap
+	}
+}
+
+// endpointOf is the address a peer last reached the node from.
+func (l *Listener) endpointOf(inner netip.Addr) (netip.AddrPort, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	ap, ok := l.endpoints[inner.Unmap()]
+	return ap, ok
+}
+
+// baseMetadata is the metadata common to every connection of a peer.
+//
+// The source is the peer's real endpoint, not its inner address: the panel counts
+// devices, applies the ingress filter and runs the torrent blocker by the client's
+// source IP. A peer whose endpoint is not known yet gets no source at all — an inner
+// address there would be counted as a device and, being identical for the same phone
+// on Wi-Fi and on LTE, would also never be the address a ban is made for.
+func (l *Listener) baseMetadata(inner netip.AddrPort, user string) *C.Metadata {
 	md := &C.Metadata{
-		Type:    C.WIREGUARD,
-		InName:  l.inName,
-		SrcIP:   src.Addr().Unmap(),
-		SrcPort: src.Port(),
+		Type:   C.WIREGUARD,
+		InName: l.inName,
 	}
 	inbound.ApplyAdditions(md, l.additions...)
 	md.InUser = user
-	if raw := net.TCPAddrFromAddrPort(src); raw != nil {
-		md.RawSrcAddr = raw
+	if ap, ok := l.endpointOf(inner.Addr()); ok {
+		md.SrcIP = ap.Addr()
+		md.SrcPort = ap.Port()
+		if raw := net.TCPAddrFromAddrPort(ap); raw != nil {
+			md.RawSrcAddr = raw
+		}
 	}
 	return md
 }

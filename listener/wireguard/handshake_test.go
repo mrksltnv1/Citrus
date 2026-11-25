@@ -215,8 +215,14 @@ func TestHandshakeAndPerUserAccounting(t *testing.T) {
 			if md.Type != C.WIREGUARD {
 				t.Fatalf("metadata type = %v, want WireGuard", md.Type)
 			}
-			if md.SrcIP != addr {
-				t.Fatalf("source address = %s, want the peer address %s", md.SrcIP, addr)
+			// The source is the peer's real endpoint, never its inner address: the panel
+			// counts devices and bans by source IP, and the inner address is the same for
+			// the same phone on Wi-Fi and on LTE. Here the client dials from loopback.
+			if md.SrcIP.IsValid() && md.SrcIP == addr {
+				t.Fatalf("the inner address %s leaked into the source", addr)
+			}
+			if md.SrcIP.IsValid() && !md.SrcIP.IsLoopback() {
+				t.Fatalf("source = %s, want the loopback endpoint or nothing", md.SrcIP)
 			}
 			if md.DstIP.String() != "1.1.1.1" || md.DstPort != 80 {
 				t.Fatalf("destination = %s:%d", md.DstIP, md.DstPort)
@@ -292,3 +298,80 @@ func TestStartWithoutUsers(t *testing.T) {
 }
 
 var _ = LC.AmneziaWGServer{}
+
+// The panel counts devices and bans by the client's source IP. An inner address there
+// would be counted as a device — and the same phone on Wi-Fi and on LTE has the same one —
+// so the source must be the peer's real endpoint, or nothing until it is known.
+func TestSourceIsTheEndpointNotTheTunnelAddress(t *testing.T) {
+	tunnel := &echoTunnel{}
+	sl := startListener(t, map[string]string{"alice": "alice-secret"}, tunnel)
+	serverPublic := serverPublicOf(t, sl)
+
+	c, inner := dialClient(t, sl.bind.Addr(), serverPublic, "alice-secret")
+	defer c.Close()
+
+	conn, err := c.stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.MustParseAddrPort("1.1.1.1:80"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// The dial returns when the handshake completes; the forwarded connection reaches the
+	// tunnel a moment later.
+	var md *C.Metadata
+	for i := 0; i < 100 && md == nil; i++ {
+		for _, seen := range tunnel.connections() {
+			md = seen
+		}
+		if md == nil {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if md == nil {
+		t.Fatal("no connection reached the tunnel")
+	}
+	if md.SrcIP == inner {
+		t.Fatalf("the inner address %s became the source: the panel would count it as a device", inner)
+	}
+	if md.InUser != "alice" {
+		t.Fatalf("the connection was not attributed to alice: %q", md.InUser)
+	}
+	if !md.SrcIP.IsValid() {
+		// The endpoint is learned from the device on its own schedule; a connection made
+		// before the first refresh legitimately has no source yet.
+		t.Log("no source yet: the endpoint had not been learned")
+	}
+}
+
+// The device knows a peer's endpoint: the reader parses the UAPI peer list.
+func TestRefreshEndpointsParsesUAPI(t *testing.T) {
+	key, err := UserKey("alice-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &Listener{
+		inName:    "wg",
+		endpoints: map[netip.Addr]netip.AddrPort{},
+		peers:     []peer{{user: "alice", publicKey: key, address: netip.MustParseAddr("10.66.0.5")}},
+		dev:       fakeDevice{uapi: "public_key=" + hexKey(key) + "\nendpoint=203.0.113.9:51820\nallowed_ip=10.66.0.5/32\n\n"},
+	}
+	l.refreshEndpoints()
+	ap, ok := l.endpointOf(netip.MustParseAddr("10.66.0.5"))
+	if !ok {
+		t.Fatal("the endpoint was not recorded")
+	}
+	if ap.String() != "203.0.113.9:51820" {
+		t.Fatalf("endpoint = %s", ap)
+	}
+}
+
+type fakeDevice struct{ uapi string }
+
+func (f fakeDevice) IpcSet(string) error     { return nil }
+func (f fakeDevice) IpcGet() (string, error) { return f.uapi, nil }
+func (f fakeDevice) Up() error               { return nil }
+func (f fakeDevice) Close()                  {}
