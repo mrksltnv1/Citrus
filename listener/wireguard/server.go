@@ -366,6 +366,7 @@ func (l *Listener) watchEndpoints() {
 func (l *Listener) refreshEndpoints() {
 	raw, err := l.dev.IpcGet()
 	if err != nil {
+		log.Debugln("WireGuard[%s] endpoint refresh: %s", l.inName, err)
 		return
 	}
 	byPub := make(map[string]netip.AddrPort)
@@ -397,6 +398,7 @@ func (l *Listener) refreshEndpoints() {
 		}
 		l.endpoints[p.address] = ap
 	}
+
 }
 
 // endpointOf is the address a peer last reached the node from.
@@ -421,7 +423,14 @@ func (l *Listener) baseMetadata(inner netip.AddrPort, user string) *C.Metadata {
 	}
 	inbound.ApplyAdditions(md, l.additions...)
 	md.InUser = user
-	if ap, ok := l.endpointOf(inner.Addr()); ok {
+	ap, ok := l.endpointOf(inner.Addr())
+	if !ok {
+		// The first connection of a peer can arrive before the ticker read its endpoint.
+		// One UAPI read is cheap and happens at most once per peer.
+		l.refreshEndpoints()
+		ap, ok = l.endpointOf(inner.Addr())
+	}
+	if ok {
 		md.SrcIP = ap.Addr()
 		md.SrcPort = ap.Port()
 		if raw := net.TCPAddrFromAddrPort(ap); raw != nil {
