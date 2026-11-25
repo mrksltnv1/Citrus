@@ -25,7 +25,7 @@ import (
 
 const (
 	defaultMTU    = 1408
-	defaultIPv4   = "10.66.66.0/24"
+	defaultIPv4   = "10.66.0.0/16"
 	udpIdleWindow = 60 * time.Second
 )
 
@@ -287,13 +287,23 @@ func (l *Listener) applyUsers() error {
 	addresses := assignAddresses(keys, l.poolAddr)
 	peers := make([]peer, 0, len(keys))
 	byAddress := make(map[netip.Addr]string, len(keys))
+	var skipped int
 	for _, key := range keys {
 		addr, ok := addresses[key]
 		if !ok {
-			return fmt.Errorf("wireguard: no free tunnel address for %q", names[key])
+			// A panel carries every slot in every listener, so it can easily have more users
+			// than the tunnel subnet has addresses. The first ones in key order get theirs;
+			// the rest cannot connect, which is a smaller harm than a listener that does not
+			// start at all.
+			skipped++
+			continue
 		}
 		peers = append(peers, peer{user: names[key], publicKey: key, address: addr})
 		byAddress[addr] = names[key]
+	}
+	if skipped > 0 {
+		log.Warnln("WireGuard[%s] %d users of %d have no address in %s: raise the tunnel subnet",
+			l.inName, skipped, len(keys), l.pool4)
 	}
 
 	conf, err := ipcConfig(l.private, l.config.AmneziaWG, sortedPeers(peers))

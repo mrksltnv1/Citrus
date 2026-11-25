@@ -1,6 +1,7 @@
 package inbound
 
 import (
+	"encoding/json"
 	"strings"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -14,13 +15,15 @@ import (
 // may set the tunnel subnets, the MTU, the worker count and the obfuscation.
 type WireGuardOption struct {
 	BaseOption
-	Users      map[string]string   `inbound:"users,omitempty"`
-	PrivateKey string              `inbound:"private-key,omitempty"`
-	MTU        int                 `inbound:"mtu,omitempty"`
-	IPv4CIDR   string              `inbound:"ipv4-cidr,omitempty"`
-	IPv6CIDR   string              `inbound:"ipv6-cidr,omitempty"`
-	Workers    int                 `inbound:"workers,omitempty"`
-	AmneziaWG  *LC.AmneziaWGServer `inbound:"amnezia-wg-option,omitempty"`
+	Users      map[string]string `inbound:"users,omitempty"`
+	PrivateKey string            `inbound:"private-key,omitempty"`
+	MTU        int               `inbound:"mtu,omitempty"`
+	IPv4CIDR   string            `inbound:"ipv4-cidr,omitempty"`
+	IPv6CIDR   string            `inbound:"ipv6-cidr,omitempty"`
+	Workers    int               `inbound:"workers,omitempty"`
+	// The obfuscation block is taken as a map: the structure decoder refuses a struct
+	// whose fields a template leaves out, and every template leaves most of them out.
+	AmneziaWG map[string]any `inbound:"amnezia-wg-option,omitempty"`
 }
 
 func (o WireGuardOption) Equal(config C.InboundConfig) bool {
@@ -51,9 +54,25 @@ func NewWireGuard(options *WireGuardOption) (*WireGuard, error) {
 			IPv4CIDR:   options.IPv4CIDR,
 			IPv6CIDR:   options.IPv6CIDR,
 			Workers:    options.Workers,
-			AmneziaWG:  options.AmneziaWG,
+			AmneziaWG:  amneziaOf(options.AmneziaWG),
 		},
 	}, nil
+}
+
+// amneziaOf converts the template block into the listener config.
+func amneziaOf(raw map[string]any) *LC.AmneziaWGServer {
+	if len(raw) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var awg LC.AmneziaWGServer
+	if err := json.Unmarshal(b, &awg); err != nil {
+		return nil
+	}
+	return &awg
 }
 
 // Config implements constant.InboundListener
